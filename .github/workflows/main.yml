@@ -1,0 +1,70 @@
+      - name: Debug & Fix RDP/Tailscale (diagnose + auto-fix)
+        shell: powershell
+        run: |
+          Write-Host "=== DIAGNOSTIC START ==="
+
+          Write-Host "`n-- 1) Tailscale version & status --"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" version || Write-Host "tailscale.exe not found"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | Out-File -FilePath "$env:TEMP\tailscale_status.json" -Encoding utf8
+          Get-Content "$env:TEMP\tailscale_status.json" -Raw | Write-Host
+
+          Write-Host "`n-- 2) Tailscale IPs --"
+          $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          Write-Host "tailscale ip output: $tsIP"
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+          Write-Host "`n-- 3) Is RDP service running and listening? --"
+          Get-Service -Name TermService | Format-List Name,Status
+          netstat -ano | Select-String ":3389" | Write-Host
+          Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue | Format-Table -AutoSize
+
+          Write-Host "`n-- 4) Firewall rules (RDP-Tailscale + profiles) --"
+          Get-NetFirewallProfile | Format-Table -AutoSize
+          Get-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue | Format-List *
+          Get-NetFirewallRule -Action Allow | Where-Object { $_.DisplayName -like "*RDP*" } | Format-Table -AutoSize
+
+          Write-Host "`n-- 5) Network interfaces --"
+          Get-NetAdapter | Format-Table -AutoSize
+          Get-NetIPConfiguration | Format-Table -AutoSize
+
+          Write-Host "`n-- 6) Ensure user exists and is in Remote Desktop Users --"
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              Write-Host "User RDP exists"
+              Get-LocalGroupMember -Group "Remote Desktop Users" -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "RDP" } | Format-List
+              Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "RDP" } | Format-List
+          } else {
+              Write-Host "User RDP NOT FOUND"
+          }
+
+          # --- Auto-fixes ---
+          Write-Host "`n=== ATTEMPTING FIXES (firewall + RDP settings) ==="
+
+          Write-Host "Enable RDP core settings again (fDenyTSConnections -> 0, disable NLA if necessary)..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
+
+          Write-Host "Create/replace firewall rule to allow inbound 3389 on all profiles (and try to target the Tailscale interface if present)..."
+          # remove old rule if exists
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          # add broad allow (all profiles)
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 profile=any program="%SystemRoot%\System32\svchost.exe"
+
+          # If we can detect a Tailscale interface alias, add an interface-specific rule too
+          $tsIface = Get-NetAdapter | Where-Object { $_.InterfaceDescription -match "Tailscale" -or $_.Name -match "Tailscale" } | Select-Object -First 1
+          if ($tsIface) {
+              Write-Host "Detected Tailscale interface: $($tsIface.Name). Adding interface-specific firewall rule."
+              # remove existing same-name rule
+              Get-NetFirewallRule -DisplayName "RDP-Tailscale-If" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -Confirm:$false -ErrorAction SilentlyContinue
+              New-NetFirewallRule -DisplayName "RDP-Tailscale-If" -Direction Inbound -InterfaceAlias $tsIface.Name -Action Allow -Protocol TCP -LocalPort 3389 -Profile Any
+          } else {
+              Write-Host "No named Tailscale adapter detected; interface-specific rule skipped."
+          }
+
+          Write-Host "`n-- Re-check listening ports and firewall briefly --"
+          netstat -ano | Select-String ":3389" | Write-Host
+          Get-NetTCPConnection -LocalPort 3389 -State Listen | Format-Table -AutoSize
+          Get-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue | Format-List *
+
+          Write-Host "`n=== DIAGNOSTIC END ==="
